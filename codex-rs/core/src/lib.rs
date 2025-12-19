@@ -37,6 +37,8 @@ pub mod models_manager;
 pub use mcp_connection_manager::MCP_SANDBOX_STATE_CAPABILITY;
 pub use mcp_connection_manager::MCP_SANDBOX_STATE_METHOD;
 pub use mcp_connection_manager::SandboxState;
+pub use openai_models::oss_model_provider::BoxedOssModelProvider;
+pub use openai_models::oss_model_provider::OssModelProvider;
 mod mcp_tool_call;
 mod message_history;
 mod model_provider_info;
