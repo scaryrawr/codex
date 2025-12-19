@@ -124,14 +124,15 @@ pub async fn run_main(
     let processor_handle = tokio::spawn({
         let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
         let cli_overrides: Vec<(String, TomlValue)> = cli_kv_overrides.clone();
-        let mut processor = MessageProcessor::new(
-            outgoing_message_sender,
-            codex_linux_sandbox_exe,
-            std::sync::Arc::new(config),
-            cli_overrides,
-            feedback.clone(),
-        );
         async move {
+            let mut processor = MessageProcessor::new(
+                outgoing_message_sender,
+                codex_linux_sandbox_exe,
+                std::sync::Arc::new(config),
+                cli_overrides,
+                feedback.clone(),
+            )
+            .await;
             while let Some(msg) = incoming_rx.recv().await {
                 match msg {
                     JSONRPCMessage::Request(r) => processor.process_request(r).await,

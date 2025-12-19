@@ -36,7 +36,7 @@ pub(crate) struct MessageProcessor {
 impl MessageProcessor {
     /// Create a new `MessageProcessor`, retaining a handle to the outgoing
     /// `Sender` so handlers can enqueue messages to be written to stdout.
-    pub(crate) fn new(
+    pub(crate) async fn new(
         outgoing: OutgoingMessageSender,
         codex_linux_sandbox_exe: Option<PathBuf>,
         config: Arc<Config>,
@@ -53,6 +53,10 @@ impl MessageProcessor {
             auth_manager.clone(),
             SessionSource::VSCode,
         ));
+
+        // Inject OSS provider if configured
+        codex_common::oss::setup_oss_provider(&*conversation_manager, &config).await;
+
         let codex_message_processor = CodexMessageProcessor::new(
             auth_manager,
             conversation_manager,
