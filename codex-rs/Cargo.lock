@@ -1503,6 +1503,7 @@ dependencies = [
 name = "codex-lmstudio"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "codex-core",
  "reqwest",
  "serde_json",
@@ -1569,6 +1570,7 @@ version = "0.0.0"
 dependencies = [
  "assert_matches",
  "async-stream",
+ "async-trait",
  "bytes",
  "codex-core",
  "futures",
