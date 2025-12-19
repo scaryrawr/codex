@@ -16,6 +16,8 @@ use tracing::error;
 
 use super::cache;
 use super::cache::ModelsCache;
+use super::oss_model_provider::BoxedOssModelProvider;
+use super::to_presets;
 use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
 use crate::auth::AuthManager;
@@ -34,16 +36,33 @@ const OPENAI_DEFAULT_CHATGPT_MODEL: &str = "gpt-5.2-codex";
 const CODEX_AUTO_BALANCED_MODEL: &str = "codex-auto-balanced";
 
 /// Coordinates remote model discovery plus cached metadata on disk.
-#[derive(Debug)]
 pub struct ModelsManager {
     // todo(aibrahim) merge available_models and model family creation into one struct
     local_models: Vec<ModelPreset>,
     remote_models: RwLock<Vec<ModelInfo>>,
+    oss_presets: RwLock<Vec<ModelPreset>>,
     auth_manager: Arc<AuthManager>,
     etag: RwLock<Option<String>>,
     codex_home: PathBuf,
     cache_ttl: Duration,
     provider: ModelProviderInfo,
+    oss_provider: RwLock<Option<BoxedOssModelProvider>>,
+}
+
+impl std::fmt::Debug for ModelsManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelsManager")
+            .field("local_models", &self.local_models)
+            .field("remote_models", &self.remote_models)
+            .field("oss_presets", &self.oss_presets)
+            .field("auth_manager", &self.auth_manager)
+            .field("etag", &self.etag)
+            .field("codex_home", &self.codex_home)
+            .field("cache_ttl", &self.cache_ttl)
+            .field("provider", &self.provider)
+            .field("oss_provider", &"<dyn OssModelProvider>")
+            .finish()
+    }
 }
 
 impl ModelsManager {
@@ -53,11 +72,13 @@ impl ModelsManager {
         Self {
             local_models: builtin_model_presets(auth_manager.get_auth_mode()),
             remote_models: RwLock::new(Self::load_remote_models_from_file().unwrap_or_default()),
+            oss_presets: RwLock::new(Vec::new()),
             auth_manager,
             etag: RwLock::new(None),
             codex_home,
             cache_ttl: DEFAULT_MODEL_CACHE_TTL,
             provider: ModelProviderInfo::create_openai_provider(),
+            oss_provider: RwLock::new(None),
         }
     }
 
@@ -68,25 +89,43 @@ impl ModelsManager {
         Self {
             local_models: builtin_model_presets(auth_manager.get_auth_mode()),
             remote_models: RwLock::new(Self::load_remote_models_from_file().unwrap_or_default()),
+            oss_presets: RwLock::new(Vec::new()),
             auth_manager,
             etag: RwLock::new(None),
             codex_home,
             cache_ttl: DEFAULT_MODEL_CACHE_TTL,
             provider,
+            oss_provider: RwLock::new(None),
         }
+    }
+
+    /// Set the OSS model provider for dependency injection.
+    pub async fn set_oss_provider(&self, provider: BoxedOssModelProvider) {
+        *self.oss_provider.write().await = Some(provider);
     }
 
     /// Fetch the latest remote models, using the on-disk cache when still fresh.
     pub async fn refresh_available_models(&self, config: &Config) -> CoreResult<()> {
-        if !config.features.enabled(Feature::RemoteModels)
-            || self.auth_manager.get_auth_mode() == Some(AuthMode::ApiKey)
-        {
-            return Ok(());
+        if config.model_provider.requires_openai_auth {
+            // OpenAI path: respect RemoteModels feature flag and use disk cache when fresh
+            if !config.features.enabled(Feature::RemoteModels)
+                || self.auth_manager.get_auth_mode() == Some(AuthMode::ApiKey)
+            {
+                return Ok(());
+            }
+            if self.try_load_cache().await {
+                return Ok(());
+            }
+            self.refresh_openai_models().await
+        } else {
+            // OSS path: always fetch fresh (no caching for local providers)
+            // OSS providers are local servers, so we don't gate on RemoteModels feature
+            self.refresh_oss_models().await
         }
-        if self.try_load_cache().await {
-            return Ok(());
-        }
+    }
 
+    /// Refresh models from OpenAI-compatible backend.
+    async fn refresh_openai_models(&self) -> CoreResult<()> {
         let auth = self.auth_manager.auth();
         let api_provider = self.provider.to_api_provider(Some(AuthMode::ChatGPT))?;
         let api_auth = auth_provider_from_auth(auth.clone(), &self.provider).await?;
@@ -107,15 +146,56 @@ impl ModelsManager {
         Ok(())
     }
 
+    /// Refresh models from an OSS provider (if configured).
+    async fn refresh_oss_models(&self) -> CoreResult<()> {
+        let provider_guard = self.oss_provider.read().await;
+        let provider = match provider_guard.as_ref() {
+            Some(p) => p,
+            None => {
+                // No OSS provider configured - this is fine for OpenAI-only setups
+                tracing::debug!("No OSS model provider configured");
+                return Ok(());
+            }
+        };
+
+        let provider_name = provider.provider_name();
+        match provider.fetch_models().await {
+            Ok(model_ids) => {
+                let presets = to_presets(model_ids, provider_name);
+                tracing::debug!("Fetched {} OSS models from {provider_name}", presets.len());
+                *self.oss_presets.write().await = presets;
+            }
+            Err(e) => {
+                // Non-fatal: user can still type model names manually
+                // Error already includes provider name from trait implementation
+                tracing::warn!("Failed to fetch OSS models from {provider_name}: {e}");
+            }
+        }
+        Ok(())
+    }
+
     pub async fn list_models(&self, config: &Config) -> Vec<ModelPreset> {
         if let Err(err) = self.refresh_available_models(config).await {
             error!("failed to refresh available models: {err}");
         }
+
+        if !config.model_provider.requires_openai_auth {
+            // OSS path: return presets directly
+            return self.oss_presets.read().await.clone();
+        }
+
+        // OpenAI path: merge remote models with local presets
         let remote_models = self.remote_models(config).await;
         self.build_available_models(remote_models)
     }
 
     pub fn try_list_models(&self, config: &Config) -> Result<Vec<ModelPreset>, TryLockError> {
+        if !config.model_provider.requires_openai_auth {
+            // OSS path: return presets directly
+            return Ok(self.oss_presets.try_read()?.clone());
+        }
+
+        // OpenAI path: merge remote models with local presets
         let remote_models = self.try_get_remote_models(config)?;
         Ok(self.build_available_models(remote_models))
     }
@@ -321,6 +401,7 @@ mod tests {
     use core_test_support::responses::mount_models_once;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::io;
     use tempfile::tempdir;
     use wiremock::MockServer;
 
@@ -675,5 +756,172 @@ mod tests {
             !response.models.is_empty(),
             "bundled models.json should contain at least one model"
         );
+    }
+
+    // Mock OSS provider for testing dependency injection
+    struct MockOssProvider {
+        provider_name: &'static str,
+        models: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::oss_model_provider::OssModelProvider for MockOssProvider {
+        async fn fetch_models(&self) -> io::Result<Vec<String>> {
+            Ok(self.models.clone())
+        }
+
+        fn provider_name(&self) -> &'static str {
+            self.provider_name
+        }
+    }
+
+    struct FailingOssProvider {
+        provider_name: &'static str,
+        error_message: String,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::oss_model_provider::OssModelProvider for FailingOssProvider {
+        async fn fetch_models(&self) -> io::Result<Vec<String>> {
+            Err(io::Error::other(format!(
+                "{}: {}",
+                self.provider_name, self.error_message
+            )))
+        }
+
+        fn provider_name(&self) -> &'static str {
+            self.provider_name
+        }
+    }
+
+    #[tokio::test]
+    async fn oss_provider_injection_without_provider() {
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+        let provider = provider_for("http://example.test".to_string());
+        let manager = ModelsManager::with_provider(auth_manager, provider);
+
+        // Should succeed without error when no OSS provider is configured
+        let result = manager.refresh_oss_models().await;
+        assert!(result.is_ok());
+
+        // OSS presets should be empty
+        let presets = manager.oss_presets.read().await;
+        assert_eq!(presets.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn oss_provider_injection_with_successful_provider() {
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+        let provider = provider_for("http://example.test".to_string());
+        let manager = ModelsManager::with_provider(auth_manager, provider);
+
+        // Inject a mock provider
+        let mock_provider = MockOssProvider {
+            provider_name: "Test Provider",
+            models: vec![
+                "model-1".to_string(),
+                "model-2".to_string(),
+                "model-3".to_string(),
+            ],
+        };
+        manager.set_oss_provider(Box::new(mock_provider)).await;
+
+        // Refresh should succeed
+        let result = manager.refresh_oss_models().await;
+        assert!(result.is_ok());
+
+        // Verify presets were created
+        let presets = manager.oss_presets.read().await;
+        assert_eq!(presets.len(), 3);
+        assert_eq!(presets[0].model, "model-1");
+        assert_eq!(presets[1].model, "model-2");
+        assert_eq!(presets[2].model, "model-3");
+        assert!(presets[0].is_default);
+        assert!(!presets[1].is_default);
+        assert!(!presets[2].is_default);
+        assert_eq!(presets[0].description, "Test Provider model");
+    }
+
+    #[tokio::test]
+    async fn oss_provider_injection_with_failing_provider() {
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+        let provider = provider_for("http://example.test".to_string());
+        let manager = ModelsManager::with_provider(auth_manager, provider);
+
+        // Inject a failing provider
+        let failing_provider = FailingOssProvider {
+            provider_name: "Failing Provider",
+            error_message: "Connection refused".to_string(),
+        };
+        manager.set_oss_provider(Box::new(failing_provider)).await;
+
+        // Should succeed (non-fatal error)
+        let result = manager.refresh_oss_models().await;
+        assert!(result.is_ok());
+
+        // OSS presets should be empty due to error
+        let presets = manager.oss_presets.read().await;
+        assert_eq!(presets.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn oss_provider_injection_with_empty_models() {
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+        let provider = provider_for("http://example.test".to_string());
+        let manager = ModelsManager::with_provider(auth_manager, provider);
+
+        // Inject a provider that returns no models
+        let mock_provider = MockOssProvider {
+            provider_name: "Empty Provider",
+            models: vec![],
+        };
+        manager.set_oss_provider(Box::new(mock_provider)).await;
+
+        // Should succeed
+        let result = manager.refresh_oss_models().await;
+        assert!(result.is_ok());
+
+        // OSS presets should be empty
+        let presets = manager.oss_presets.read().await;
+        assert_eq!(presets.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn oss_provider_can_be_replaced() {
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+        let provider = provider_for("http://example.test".to_string());
+        let manager = ModelsManager::with_provider(auth_manager, provider);
+
+        // Inject first provider
+        let first_provider = MockOssProvider {
+            provider_name: "First Provider",
+            models: vec!["first-model".to_string()],
+        };
+        manager.set_oss_provider(Box::new(first_provider)).await;
+        manager.refresh_oss_models().await.unwrap();
+
+        let presets = manager.oss_presets.read().await;
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].model, "first-model");
+        drop(presets);
+
+        // Replace with second provider
+        let second_provider = MockOssProvider {
+            provider_name: "Second Provider",
+            models: vec!["second-model-1".to_string(), "second-model-2".to_string()],
+        };
+        manager.set_oss_provider(Box::new(second_provider)).await;
+        manager.refresh_oss_models().await.unwrap();
+
+        // Verify new presets
+        let presets = manager.oss_presets.read().await;
+        assert_eq!(presets.len(), 2);
+        assert_eq!(presets[0].model, "second-model-1");
+        assert_eq!(presets[1].model, "second-model-2");
     }
 }
