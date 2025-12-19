@@ -1,4 +1,6 @@
+use async_trait::async_trait;
 use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
+use codex_core::OssModelProvider;
 use codex_core::config::Config;
 use std::io;
 use std::path::Path;
@@ -91,36 +93,9 @@ impl LMStudioClient {
         }
     }
 
-    // Return the list of models available on the LM Studio server.
+    /// Fetch available models from LM Studio.
     pub async fn fetch_models(&self) -> io::Result<Vec<String>> {
-        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| io::Error::other(format!("Request failed: {e}")))?;
-
-        if response.status().is_success() {
-            let json: serde_json::Value = response.json().await.map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("JSON parse error: {e}"))
-            })?;
-            let models = json["data"]
-                .as_array()
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "No 'data' array in response")
-                })?
-                .iter()
-                .filter_map(|model| model["id"].as_str())
-                .map(std::string::ToString::to_string)
-                .collect();
-            Ok(models)
-        } else {
-            Err(io::Error::other(format!(
-                "Failed to fetch models: {}",
-                response.status()
-            )))
-        }
+        <Self as OssModelProvider>::fetch_models(self).await
     }
 
     // Find lms, checking fallback paths if not in PATH
@@ -203,6 +178,50 @@ impl LMStudioClient {
     }
 }
 
+#[async_trait]
+impl OssModelProvider for LMStudioClient {
+    async fn fetch_models(&self) -> io::Result<Vec<String>> {
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| io::Error::other(format!("LM Studio: Request failed: {e}")))?;
+
+        if response.status().is_success() {
+            let json: serde_json::Value = response.json().await.map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("LM Studio: JSON parse error: {e}"),
+                )
+            })?;
+            let models = json["data"]
+                .as_array()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "LM Studio: No 'data' array in response",
+                    )
+                })?
+                .iter()
+                .filter_map(|model| model["id"].as_str())
+                .map(std::string::ToString::to_string)
+                .collect();
+            Ok(models)
+        } else {
+            Err(io::Error::other(format!(
+                "LM Studio: Failed to fetch models: {}",
+                response.status()
+            )))
+        }
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "LM Studio"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -267,7 +286,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("No 'data' array in response")
+                .contains("LM Studio: No 'data' array in response")
         );
     }
 
@@ -295,7 +314,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Failed to fetch models: 500")
+                .contains("LM Studio: Failed to fetch models: 500")
         );
     }
 
@@ -393,5 +412,163 @@ mod tests {
 
         let client = LMStudioClient::from_host_root("https://example.com:8080/api");
         assert_eq!(client.base_url, "https://example.com:8080/api");
+    }
+
+    // Trait implementation tests
+    #[tokio::test]
+    async fn test_trait_fetch_models_happy_path() {
+        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+            tracing::info!(
+                "{} is set; skipping test_trait_fetch_models_happy_path",
+                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
+            );
+            return;
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/models"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_raw(
+                    serde_json::json!({
+                        "data": [
+                            {"id": "model-1"},
+                            {"id": "model-2"},
+                        ]
+                    })
+                    .to_string(),
+                    "application/json",
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let client = LMStudioClient::from_host_root(server.uri());
+        let provider: &dyn codex_core::OssModelProvider = &client;
+        let models = provider
+            .fetch_models()
+            .await
+            .expect("fetch models via trait");
+        assert_eq!(models, vec!["model-1", "model-2"]);
+    }
+
+    #[tokio::test]
+    async fn test_trait_fetch_models_malformed_json() {
+        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+            tracing::info!(
+                "{} is set; skipping test_trait_fetch_models_malformed_json",
+                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
+            );
+            return;
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/models"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw("not valid json", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = LMStudioClient::from_host_root(server.uri());
+        let provider: &dyn codex_core::OssModelProvider = &client;
+        let result = provider.fetch_models().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("LM Studio: JSON parse error"));
+    }
+
+    #[tokio::test]
+    async fn test_trait_fetch_models_http_error() {
+        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+            tracing::info!(
+                "{} is set; skipping test_trait_fetch_models_http_error",
+                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
+            );
+            return;
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/models"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = LMStudioClient::from_host_root(server.uri());
+        let provider: &dyn codex_core::OssModelProvider = &client;
+        let result = provider.fetch_models().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("LM Studio: Failed to fetch models: 503")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trait_fetch_models_empty_list() {
+        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+            tracing::info!(
+                "{} is set; skipping test_trait_fetch_models_empty_list",
+                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
+            );
+            return;
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/models"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
+                serde_json::json!({"data": []}).to_string(),
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let client = LMStudioClient::from_host_root(server.uri());
+        let provider: &dyn codex_core::OssModelProvider = &client;
+        let models = provider.fetch_models().await.expect("fetch models");
+        assert_eq!(models, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn test_trait_fetch_models_missing_data_array() {
+        if std::env::var(codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+            tracing::info!(
+                "{} is set; skipping test_trait_fetch_models_missing_data_array",
+                codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
+            );
+            return;
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/models"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
+                serde_json::json!({"other": "field"}).to_string(),
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let client = LMStudioClient::from_host_root(server.uri());
+        let provider: &dyn codex_core::OssModelProvider = &client;
+        let result = provider.fetch_models().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("LM Studio: No 'data' array in response")
+        );
+    }
+
+    #[test]
+    fn test_trait_provider_name() {
+        let client = LMStudioClient::from_host_root("http://localhost:1234");
+        let provider: &dyn codex_core::OssModelProvider = &client;
+        assert_eq!(provider.provider_name(), "LM Studio");
     }
 }
