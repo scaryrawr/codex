@@ -410,6 +410,10 @@ impl App {
             auth_manager.clone(),
             SessionSource::Cli,
         ));
+
+        // Inject OSS provider if configured
+        codex_common::oss::setup_oss_provider(&conversation_manager, &config).await;
+
         let mut model = conversation_manager
             .get_models_manager()
             .get_model(&config.model, &config)
