@@ -50,7 +50,7 @@ impl OllamaClient {
     #[cfg(test)]
     async fn try_from_provider_with_base_url(base_url: &str) -> io::Result<Self> {
         let provider =
-            codex_core::create_oss_provider_with_base_url(base_url, codex_core::WireApi::Chat);
+            codex_core::create_oss_provider_with_base_url(base_url, codex_core::WireApi::Responses);
         Self::try_from_provider(&provider).await
     }
 
@@ -62,7 +62,7 @@ impl OllamaClient {
             .as_ref()
             .expect("oss provider must have a base_url");
         let uses_openai_compat = is_openai_compatible_base_url(base_url)
-            || matches!(provider.wire_api, WireApi::Chat)
+            || matches!(provider.wire_api, WireApi::Responses)
                 && is_openai_compatible_base_url(base_url);
         let host_root = base_url_to_host_root(base_url);
         let client = reqwest::Client::builder()

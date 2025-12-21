@@ -273,7 +273,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
         ("openai", P::create_openai_provider()),
         (
             OLLAMA_OSS_PROVIDER_ID,
-            create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Chat),
+            create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
         ),
         (
             LMSTUDIO_OSS_PROVIDER_ID,
@@ -340,7 +340,7 @@ base_url = "http://localhost:11434/v1"
             env_key: None,
             env_key_instructions: None,
             experimental_bearer_token: None,
-            wire_api: WireApi::Chat,
+            wire_api: WireApi::Responses,
             query_params: None,
             http_headers: None,
             env_http_headers: None,
