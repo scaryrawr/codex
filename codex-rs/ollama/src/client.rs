@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use bytes::BytesMut;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -13,6 +14,7 @@ use crate::url::base_url_to_host_root;
 use crate::url::is_openai_compatible_base_url;
 use codex_core::ModelProviderInfo;
 use codex_core::OLLAMA_OSS_PROVIDER_ID;
+use codex_core::OssModelProvider;
 use codex_core::WireApi;
 use codex_core::config::Config;
 
@@ -102,28 +104,7 @@ impl OllamaClient {
 
     /// Return the list of model names known to the local Ollama instance.
     pub async fn fetch_models(&self) -> io::Result<Vec<String>> {
-        let tags_url = format!("{}/api/tags", self.host_root.trim_end_matches('/'));
-        let resp = self
-            .client
-            .get(tags_url)
-            .send()
-            .await
-            .map_err(io::Error::other)?;
-        if !resp.status().is_success() {
-            return Ok(Vec::new());
-        }
-        let val = resp.json::<JsonValue>().await.map_err(io::Error::other)?;
-        let names = val
-            .get("models")
-            .and_then(|m| m.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Ok(names)
+        <Self as OssModelProvider>::fetch_models(self).await
     }
 
     /// Query the server for its version string, returning `None` when unavailable.
@@ -257,6 +238,41 @@ impl OllamaClient {
             host_root: host_root.into(),
             uses_openai_compat: false,
         }
+    }
+}
+
+#[async_trait]
+impl OssModelProvider for OllamaClient {
+    async fn fetch_models(&self) -> io::Result<Vec<String>> {
+        let tags_url = format!("{}/api/tags", self.host_root.trim_end_matches('/'));
+        let resp = self
+            .client
+            .get(tags_url)
+            .send()
+            .await
+            .map_err(|e| io::Error::other(format!("Ollama: Request failed: {e}")))?;
+        if !resp.status().is_success() {
+            return Ok(Vec::new());
+        }
+        let val = resp
+            .json::<JsonValue>()
+            .await
+            .map_err(|e| io::Error::other(format!("Ollama: JSON parse error: {e}")))?;
+        let names = val
+            .get("models")
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(names)
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "Ollama"
     }
 }
 

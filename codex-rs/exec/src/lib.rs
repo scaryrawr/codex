@@ -344,6 +344,10 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         auth_manager.clone(),
         SessionSource::Exec,
     ));
+
+    // Inject OSS provider if configured
+    codex_common::oss::inject_oss_provider(thread_manager.get_models_manager().as_ref(), &config)
+        .await;
     let default_model = thread_manager
         .get_models_manager()
         .get_default_model(&config.model, &config, RefreshStrategy::OnlineIfUncached)

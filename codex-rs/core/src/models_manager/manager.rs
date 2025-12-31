@@ -1,4 +1,5 @@
 use super::cache::ModelsCacheManager;
+use super::oss_model_provider::BoxedOssModelProvider;
 use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
 use crate::auth::AuthManager;
@@ -18,6 +19,8 @@ use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use http::HeaderMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,14 +46,30 @@ pub enum RefreshStrategy {
 }
 
 /// Coordinates remote model discovery plus cached metadata on disk.
-#[derive(Debug)]
 pub struct ModelsManager {
     local_models: Vec<ModelPreset>,
+    oss_models: RwLock<Vec<ModelPreset>>,
     remote_models: RwLock<Vec<ModelInfo>>,
     auth_manager: Arc<AuthManager>,
     etag: RwLock<Option<String>>,
     cache_manager: ModelsCacheManager,
     provider: ModelProviderInfo,
+    oss_provider: RwLock<Option<BoxedOssModelProvider>>,
+}
+
+impl std::fmt::Debug for ModelsManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelsManager")
+            .field("local_models", &self.local_models)
+            .field("oss_models", &self.oss_models)
+            .field("remote_models", &self.remote_models)
+            .field("auth_manager", &self.auth_manager)
+            .field("etag", &self.etag)
+            .field("cache_manager", &self.cache_manager)
+            .field("provider", &self.provider)
+            .field("oss_provider", &"<dyn OssModelProvider>")
+            .finish()
+    }
 }
 
 impl ModelsManager {
@@ -62,12 +81,19 @@ impl ModelsManager {
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
         Self {
             local_models: builtin_model_presets(auth_manager.get_auth_mode()),
+            oss_models: RwLock::new(Vec::new()),
             remote_models: RwLock::new(Self::load_remote_models_from_file().unwrap_or_default()),
             auth_manager,
             etag: RwLock::new(None),
             cache_manager,
             provider: ModelProviderInfo::create_openai_provider(),
+            oss_provider: RwLock::new(None),
         }
+    }
+
+    /// Set the OSS model provider for dependency injection.
+    pub async fn set_oss_provider(&self, provider: BoxedOssModelProvider) {
+        *self.oss_provider.write().await = Some(provider);
     }
 
     /// List all available models, refreshing according to the specified strategy.
@@ -84,6 +110,13 @@ impl ModelsManager {
         {
             error!("failed to refresh available models: {err}");
         }
+
+        if !config.model_provider.requires_openai_auth {
+            // OSS path: return presets directly
+            return self.oss_models.read().await.clone();
+        }
+
+        // OpenAI path: merge remote models with local presets
         let remote_models = self.get_remote_models(config).await;
         self.build_available_models(remote_models)
     }
@@ -99,6 +132,12 @@ impl ModelsManager {
     ///
     /// Returns an error if the internal lock cannot be acquired.
     pub fn try_list_models(&self, config: &Config) -> Result<Vec<ModelPreset>, TryLockError> {
+        if !config.model_provider.requires_openai_auth {
+            // OSS path: return presets directly
+            return Ok(self.oss_models.try_read()?.clone());
+        }
+
+        // OpenAI path: merge remote models with local presets
         let remote_models = self.try_get_remote_models(config)?;
         Ok(self.build_available_models(remote_models))
     }
@@ -174,6 +213,12 @@ impl ModelsManager {
         config: &Config,
         refresh_strategy: RefreshStrategy,
     ) -> CoreResult<()> {
+        if !config.model_provider.requires_openai_auth {
+            // OSS path: always fetch fresh (no caching for local providers)
+            return self.refresh_oss_models().await;
+        }
+
+        // OpenAI path: respect RemoteModels feature flag
         if !config.features.enabled(Feature::RemoteModels)
             || self.auth_manager.get_auth_mode() == Some(AuthMode::ApiKey)
         {
@@ -198,6 +243,34 @@ impl ModelsManager {
                 self.fetch_and_update_models().await
             }
         }
+    }
+
+    /// Refresh models from an OSS provider (if configured).
+    async fn refresh_oss_models(&self) -> CoreResult<()> {
+        let provider_guard = self.oss_provider.read().await;
+        let provider = match provider_guard.as_ref() {
+            Some(p) => p,
+            None => {
+                // No OSS provider configured - this is fine for OpenAI-only setups
+                tracing::debug!("No OSS model provider configured");
+                return Ok(());
+            }
+        };
+
+        let provider_name = provider.provider_name();
+        match provider.fetch_models().await {
+            Ok(model_ids) => {
+                let presets = to_presets(model_ids, provider_name);
+                tracing::debug!("Fetched {} OSS models from {provider_name}", presets.len());
+                *self.oss_models.write().await = presets;
+            }
+            Err(e) => {
+                // Non-fatal: user can still type model names manually
+                // Error already includes provider name from trait implementation
+                tracing::warn!("Failed to fetch OSS models from {provider_name}: {e}");
+            }
+        }
+        Ok(())
     }
 
     async fn fetch_and_update_models(&self) -> CoreResult<()> {
@@ -320,11 +393,13 @@ impl ModelsManager {
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
         Self {
             local_models: builtin_model_presets(auth_manager.get_auth_mode()),
+            oss_models: RwLock::new(Vec::new()),
             remote_models: RwLock::new(Self::load_remote_models_from_file().unwrap_or_default()),
             auth_manager,
             etag: RwLock::new(None),
             cache_manager,
             provider,
+            oss_provider: RwLock::new(None),
         }
     }
 
@@ -358,6 +433,32 @@ fn format_client_version_to_whole() -> String {
         env!("CARGO_PKG_VERSION_MINOR"),
         env!("CARGO_PKG_VERSION_PATCH")
     )
+}
+
+/// Convert OSS model IDs to ModelPresets.
+fn to_presets(model_ids: Vec<String>, provider: &str) -> Vec<ModelPreset> {
+    model_ids
+        .into_iter()
+        .enumerate()
+        .map(|(idx, model_id)| ModelPreset {
+            id: model_id.clone(),
+            model: model_id.clone(),
+            display_name: model_id,
+            description: format!("{provider} model"),
+            default_reasoning_effort: ReasoningEffort::None,
+            // OSS models don't support reasoning effort configuration.
+            // We include a single "None" entry so the UI dismisses on select
+            // (the UI checks `supported_reasoning_efforts.len() == 1` for this).
+            supported_reasoning_efforts: vec![ReasoningEffortPreset {
+                effort: ReasoningEffort::None,
+                description: "Default".to_string(),
+            }],
+            is_default: idx == 0,
+            upgrade: None,
+            show_in_picker: true,
+            supported_in_api: true,
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -42,6 +42,8 @@ mod transport_manager;
 pub use mcp_connection_manager::MCP_SANDBOX_STATE_CAPABILITY;
 pub use mcp_connection_manager::MCP_SANDBOX_STATE_METHOD;
 pub use mcp_connection_manager::SandboxState;
+pub use models_manager::oss_model_provider::BoxedOssModelProvider;
+pub use models_manager::oss_model_provider::OssModelProvider;
 mod mcp_tool_call;
 mod mentions;
 mod message_history;

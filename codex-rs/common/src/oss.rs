@@ -5,6 +5,7 @@ use codex_core::OLLAMA_CHAT_PROVIDER_ID;
 use codex_core::OLLAMA_OSS_PROVIDER_ID;
 use codex_core::WireApi;
 use codex_core::config::Config;
+use codex_core::models_manager::manager::ModelsManager;
 use codex_core::protocol::DeprecationNoticeEvent;
 use std::io;
 
@@ -45,6 +46,36 @@ pub async fn ollama_chat_deprecation_notice(
     }
 
     Ok(None)
+}
+
+/// Convenience wrapper to inject OSS provider into a ThreadManager.
+///
+/// This is the recommended way to set up OSS providers in entry points.
+/// Equivalent to calling `inject_oss_provider(tm.get_models_manager().as_ref(), config)`.
+pub async fn setup_oss_provider(thread_manager: &codex_core::ThreadManager, config: &Config) {
+    inject_oss_provider(thread_manager.get_models_manager().as_ref(), config).await
+}
+
+/// Inject OSS provider into ModelsManager based on the config's model_provider_id.
+///
+/// This enables the ModelsManager to fetch models from local OSS providers (LM Studio, Ollama).
+/// Call this after creating a ModelsManager and before refreshing models.
+pub async fn inject_oss_provider(models_manager: &ModelsManager, config: &Config) {
+    match config.model_provider_id.as_str() {
+        LMSTUDIO_OSS_PROVIDER_ID => {
+            if let Ok(client) = codex_lmstudio::LMStudioClient::try_from_provider(config).await {
+                models_manager.set_oss_provider(Box::new(client)).await;
+            }
+        }
+        OLLAMA_OSS_PROVIDER_ID => {
+            if let Ok(client) = codex_ollama::OllamaClient::try_from_oss_provider(config).await {
+                models_manager.set_oss_provider(Box::new(client)).await;
+            }
+        }
+        _ => {
+            // Not an OSS provider - no injection needed
+        }
+    }
 }
 
 /// Ensures the specified OSS provider is ready (models downloaded, service reachable).
