@@ -1,4 +1,6 @@
+use async_trait::async_trait;
 use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
+use codex_core::OssModelProvider;
 use codex_core::config::Config;
 use std::io;
 use std::path::Path;
@@ -91,36 +93,9 @@ impl LMStudioClient {
         }
     }
 
-    // Return the list of models available on the LM Studio server.
+    /// Fetch available models from LM Studio.
     pub async fn fetch_models(&self) -> io::Result<Vec<String>> {
-        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| io::Error::other(format!("Request failed: {e}")))?;
-
-        if response.status().is_success() {
-            let json: serde_json::Value = response.json().await.map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("JSON parse error: {e}"))
-            })?;
-            let models = json["data"]
-                .as_array()
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "No 'data' array in response")
-                })?
-                .iter()
-                .filter_map(|model| model["id"].as_str())
-                .map(std::string::ToString::to_string)
-                .collect();
-            Ok(models)
-        } else {
-            Err(io::Error::other(format!(
-                "Failed to fetch models: {}",
-                response.status()
-            )))
-        }
+        <Self as OssModelProvider>::fetch_models(self).await
     }
 
     // Find lms, checking fallback paths if not in PATH
@@ -203,6 +178,50 @@ impl LMStudioClient {
     }
 }
 
+#[async_trait]
+impl OssModelProvider for LMStudioClient {
+    async fn fetch_models(&self) -> io::Result<Vec<String>> {
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| io::Error::other(format!("LM Studio: Request failed: {e}")))?;
+
+        if response.status().is_success() {
+            let json: serde_json::Value = response.json().await.map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("LM Studio: JSON parse error: {e}"),
+                )
+            })?;
+            let models = json["data"]
+                .as_array()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "LM Studio: No 'data' array in response",
+                    )
+                })?
+                .iter()
+                .filter_map(|model| model["id"].as_str())
+                .map(std::string::ToString::to_string)
+                .collect();
+            Ok(models)
+        } else {
+            Err(io::Error::other(format!(
+                "LM Studio: Failed to fetch models: {}",
+                response.status()
+            )))
+        }
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "LM Studio"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -267,7 +286,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("No 'data' array in response")
+                .contains("LM Studio: No 'data' array in response")
         );
     }
 
@@ -295,7 +314,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Failed to fetch models: 500")
+                .contains("LM Studio: Failed to fetch models: 500")
         );
     }
 
