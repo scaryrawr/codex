@@ -416,6 +416,14 @@ impl App {
             auth_manager.clone(),
             SessionSource::Cli,
         ));
+
+        // Inject OSS provider if configured
+        codex_common::oss::inject_oss_provider(
+            thread_manager.get_models_manager().as_ref(),
+            &config,
+        )
+        .await;
+
         let mut model = thread_manager
             .get_models_manager()
             .get_model(&config.model, &config)
