@@ -851,7 +851,8 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
         let provider = provider_for("http://example.test".to_string());
-        let manager = ModelsManager::with_provider(auth_manager, provider);
+        let codex_home = std::env::temp_dir().join("codex-test");
+        let manager = ModelsManager::with_provider(codex_home, auth_manager, provider);
 
         // No provider: should succeed with empty models
         assert!(manager.refresh_oss_models().await.is_ok());
