@@ -474,6 +474,7 @@ mod tests {
     use core_test_support::responses::mount_models_once;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::io;
     use tempfile::tempdir;
     use wiremock::MockServer;
 
@@ -824,5 +825,115 @@ mod tests {
             !response.models.is_empty(),
             "bundled models.json should contain at least one model"
         );
+    }
+
+    // Mock OSS provider for testing dependency injection
+    struct MockOssProvider {
+        provider_name: &'static str,
+        result: io::Result<Vec<String>>,
+    }
+
+    impl MockOssProvider {
+        fn returning(models: Vec<String>) -> Self {
+            Self {
+                provider_name: "Test Provider",
+                result: Ok(models),
+            }
+        }
+        fn failing(msg: &str) -> Self {
+            Self {
+                provider_name: "Failing Provider",
+                result: Err(io::Error::other(msg.to_string())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::oss_model_provider::OssModelProvider for MockOssProvider {
+        async fn fetch_models(&self) -> io::Result<Vec<String>> {
+            match &self.result {
+                Ok(v) => Ok(v.clone()),
+                Err(e) => Err(io::Error::other(e.to_string())),
+            }
+        }
+        fn provider_name(&self) -> &'static str {
+            self.provider_name
+        }
+    }
+
+    #[tokio::test]
+    async fn oss_provider_injection_scenarios() {
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+        let provider = provider_for("http://example.test".to_string());
+        let codex_home = std::env::temp_dir().join("codex-test");
+        let manager = ModelsManager::with_provider(codex_home, auth_manager, provider);
+
+        // No provider: should succeed with empty models
+        assert!(manager.refresh_oss_models().await.is_ok());
+        assert!(manager.oss_models.read().await.is_empty());
+
+        // With mock provider: should populate oss_models
+        manager
+            .set_oss_provider(Box::new(MockOssProvider::returning(vec![
+                "model-1".into(),
+                "model-2".into(),
+            ])))
+            .await;
+        manager.refresh_oss_models().await.unwrap();
+        let presets = manager.oss_models.read().await;
+        assert_eq!(presets.len(), 2);
+        assert!(presets[0].is_default);
+        assert_eq!(presets[0].model, "model-1");
+        drop(presets);
+
+        // With failing provider: should succeed (non-fatal), previous models preserved
+        manager
+            .set_oss_provider(Box::new(MockOssProvider::failing("connection refused")))
+            .await;
+        assert!(manager.refresh_oss_models().await.is_ok());
+        let presets = manager.oss_models.read().await;
+        assert_eq!(presets.len(), 2); // Previous models preserved on error
+        drop(presets);
+
+        // Provider replacement: new provider's models replace old ones
+        manager
+            .set_oss_provider(Box::new(MockOssProvider::returning(vec![
+                "replaced-model".into(),
+            ])))
+            .await;
+        manager.refresh_oss_models().await.unwrap();
+        let presets = manager.oss_models.read().await;
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].model, "replaced-model");
+    }
+
+    #[test]
+    fn to_presets_sets_first_as_default() {
+        let ids = vec!["model-a".into(), "model-b".into()];
+        let presets = to_presets(ids, "Test");
+
+        assert_eq!(presets.len(), 2);
+        assert!(presets[0].is_default);
+        assert!(!presets[1].is_default);
+        assert_eq!(presets[0].model, "model-a");
+        assert_eq!(presets[0].description, "Test model");
+    }
+
+    #[test]
+    fn to_presets_empty_input() {
+        let presets = to_presets(vec![], "Test");
+        assert!(presets.is_empty());
+    }
+
+    #[test]
+    fn to_presets_single_model_is_default() {
+        let ids = vec!["only-model".into()];
+        let presets = to_presets(ids, "Provider");
+
+        assert_eq!(presets.len(), 1);
+        assert!(presets[0].is_default);
+        assert_eq!(presets[0].model, "only-model");
+        assert_eq!(presets[0].display_name, "only-model");
     }
 }
