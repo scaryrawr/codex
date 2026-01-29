@@ -453,6 +453,7 @@ fn to_presets(model_ids: Vec<String>, provider: &str) -> Vec<ModelPreset> {
                 effort: ReasoningEffort::None,
                 description: "Default".to_string(),
             }],
+            supports_personality: false,
             is_default: idx == 0,
             upgrade: None,
             show_in_picker: true,
